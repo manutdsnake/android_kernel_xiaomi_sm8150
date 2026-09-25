@@ -291,6 +291,17 @@ static int qpnp_tri_led_set_brightness(struct led_classdev *led_cdev,
 		return 0;
 	}
 
+	/*
+	 * A non-zero brightness while the hardware blinks (timer trigger with
+	 * delay_on/off, set first by e.g. hfd-service) must not cancel the
+	 * blink: it would leave a notification LED steadily on.
+	 */
+	if (led->blinking && brightness) {
+		led->led_setting.brightness = brightness;
+		mutex_unlock(&led->lock);
+		return 0;
+	}
+
 	led->led_setting.brightness = brightness;
 	if (!!brightness)
 		led->led_setting.off_ms = 0;
