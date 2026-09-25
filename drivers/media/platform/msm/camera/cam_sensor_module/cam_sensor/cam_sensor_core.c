@@ -592,6 +592,22 @@ void cam_sensor_shutdown(struct cam_sensor_ctrl_t *s_ctrl)
 		(s_ctrl->is_probe_succeed == 0))
 		return;
 
+	/*
+	 * cepheus: a close in INIT state has nothing to shut down.  Wiping the
+	 * probe (is_probe_succeed, power settings) here meant that any process
+	 * opening and closing the subdev after the camera HAL had probed made
+	 * the HAL's next CAM_ACQUIRE_DEV fail ("Not in right state to aquire 0")
+	 * and CamX abort - the black first camera start after every boot.
+	 * A new HAL process still probes fine ("Already Sensor Probed" is rc 0).
+	 */
+	if (s_ctrl->sensor_state == CAM_SENSOR_INIT) {
+		CAM_INFO(CAM_SENSOR,
+			"subdev closed in INIT by %s[%d], probe of 0x%x kept",
+			current->comm, current->pid,
+			s_ctrl->sensordata->slave_info.sensor_id);
+		return;
+	}
+
 	cam_sensor_release_stream_rsc(s_ctrl);
 	cam_sensor_release_per_frame_resource(s_ctrl);
 
