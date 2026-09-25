@@ -810,6 +810,10 @@ endif
 
 KBUILD_CFLAGS += $(call cc-disable-warning, unused-const-variable)
 
+# clang 18 is stricter than the compiler this tree was written for; the qcacld
+# WLAN driver trips -Wfortify-source as an error.
+KBUILD_CFLAGS += -Wno-fortify-source -Wno-error -Wno-ignored-optimization-argument -Wno-unused-command-line-argument -Wno-deprecated-non-prototype
+
 # These result in bogus false positives
 KBUILD_CFLAGS += $(call cc-disable-warning, dangling-pointer)
 
