@@ -361,6 +361,11 @@ struct fts_ts_info {
 	bool p_sensor_switch;
 	bool palm_sensor_changed;
 	bool palm_sensor_switch;
+	/* cepheus: proximity from the controller's pocket mode (see fts.c) */
+	struct input_dev *prox_dev;
+	bool prox_active;
+	bool prox_kept_sensing;
+	struct delayed_work prox_far_work;
 	bool tp_pm_suspend;
 	struct completion pm_resume_completion;
 };

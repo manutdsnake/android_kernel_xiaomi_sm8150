@@ -3538,6 +3538,81 @@ static void fts_controller_ready_event_handler(struct fts_ts_info *info,
 * Event handler for status events (EVT_ID_STATUS_UPDATE)
 * Handle status update events
 */
+/*
+ * cepheus: proximity from the touch controller.
+ *
+ * The Mi 9's proximity sensor is Elliptic ultrasound behind the 32-bit audio
+ * HAL, which Ubuntu Touch does not run.  The FTS controller has a pocket
+ * ("anti mis-touch") mode instead: command C0 07 01 makes it report
+ * EVT_TYPE_STATUS_POCKET, 43 09 01 when the upper screen is covered and
+ * 43 09 00 when it is not.  Expose that as ABS_DISTANCE (0 near, 1 far - the
+ * semantics sensorfw's evdev proximity adaptor expects) on an input device
+ * of its own, "fts_proximity"; udev tells libinput to leave it alone.
+ * Pocket mode is on only while the device is open, and a proximity-driven
+ * screen-off keeps the controller sensing (touches ignored via sensor_sleep)
+ * so "far" can turn the screen back on.  "Far" is delayed 300 ms: the edge
+ * of a hand makes the status flicker.
+ */
+static void fts_prox_far_work(struct work_struct *work)
+{
+	struct fts_ts_info *info = container_of(to_delayed_work(work),
+						struct fts_ts_info,
+						prox_far_work);
+
+	input_report_abs(info->prox_dev, ABS_DISTANCE, 1);
+	input_sync(info->prox_dev);
+}
+
+static void fts_prox_report(struct fts_ts_info *info, bool near)
+{
+	if (near) {
+		cancel_delayed_work(&info->prox_far_work);
+		input_report_abs(info->prox_dev, ABS_DISTANCE, 0);
+		input_sync(info->prox_dev);
+	} else {
+		mod_delayed_work(system_wq, &info->prox_far_work,
+				 msecs_to_jiffies(300));
+	}
+}
+
+static int fts_prox_open(struct input_dev *dev)
+{
+	struct fts_ts_info *info = input_get_drvdata(dev);
+
+	info->prox_active = true;
+	/*
+	 * Start from "far", delivered as a real event: the input core drops a
+	 * value equal to the last one (usually far from the previous session),
+	 * and sensorfw starts reading only after open() returns.  Forget the
+	 * old value and report far a moment later; a covered screen follows
+	 * as soon as pocket mode reports it.
+	 */
+	input_abs_set_val(dev, ABS_DISTANCE, -1);
+	mod_delayed_work(system_wq, &info->prox_far_work,
+			 msecs_to_jiffies(200));
+	if (info->resume_bit)
+		fts_palm_sensor_cmd(1);
+	return 0;
+}
+
+static void fts_prox_close(struct input_dev *dev)
+{
+	struct fts_ts_info *info = input_get_drvdata(dev);
+
+	info->prox_active = false;
+	cancel_delayed_work_sync(&info->prox_far_work);
+	if (info->resume_bit) {
+		fts_palm_sensor_cmd(0);
+	} else if (info->prox_kept_sensing) {
+		/* the screen went off while in use: finish that sense off now */
+		fts_disableInterrupt();
+		fts_mode_handler(info, 0);
+		if (info->gesture_enabled || info->fod_status)
+			fts_enableInterrupt();
+	}
+	info->prox_kept_sensing = false;
+}
+
 static void fts_status_event_handler(struct fts_ts_info *info,
 				     unsigned char *event)
 {
@@ -3720,6 +3795,12 @@ static void fts_status_event_handler(struct fts_ts_info *info,
 		} else if (event[0] == 0x43 && event[2] == 0x00) {
 			update_palm_sensor_value(0);
 		}
+		break;
+#endif
+#ifndef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+	case EVT_TYPE_STATUS_POCKET:
+		if (event[0] == 0x43 && info->prox_dev && info->prox_active)
+			fts_prox_report(info, event[2] == 0x01);
 		break;
 #endif
 	default:
@@ -5763,6 +5844,9 @@ static void fts_resume_work(struct work_struct *work)
 	info->sleep_finger = 0;
 
 	fts_enableInterrupt();
+	info->prox_kept_sensing = false;
+	if (info->prox_active)
+		fts_palm_sensor_cmd(1);
 #ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
 	if (info->palm_sensor_switch && !info->palm_sensor_changed) {
 		fts_palm_sensor_cmd(info->palm_sensor_switch);
@@ -5791,6 +5875,14 @@ static void fts_suspend_work(struct work_struct *work)
 		info->palm_sensor_switch = false;
 	}
 #endif
+	if (info->prox_active) {
+		/* cepheus: keep sensing so the proximity switch can report far */
+		info->resume_bit = 0;
+		info->prox_kept_sensing = true;
+		release_all_touches(info);
+		info->sensor_sleep = true;
+		return;
+	}
 	fts_disableInterrupt();
 	info->resume_bit = 0;
 	fts_mode_handler(info, 0);
@@ -7146,6 +7238,23 @@ static int fts_probe(struct spi_device *client)
 	}
 
 	skip_5_1 = 1;
+
+	info->prox_dev = input_allocate_device();
+	if (info->prox_dev) {
+		info->prox_dev->name = "fts_proximity";
+		info->prox_dev->id.bustype = BUS_SPI;
+		__set_bit(EV_ABS, info->prox_dev->evbit);
+		input_set_abs_params(info->prox_dev, ABS_DISTANCE, 0, 1, 0, 0);
+		info->prox_dev->open = fts_prox_open;
+		info->prox_dev->close = fts_prox_close;
+		input_set_drvdata(info->prox_dev, info);
+		INIT_DELAYED_WORK(&info->prox_far_work, fts_prox_far_work);
+		if (input_register_device(info->prox_dev)) {
+			logError(1, "%s cannot register fts_proximity\n", tag);
+			input_free_device(info->prox_dev);
+			info->prox_dev = NULL;
+		}
+	}
 	/* track slots */
 	info->touch_id = 0;
 #ifdef STYLUS_MODE
